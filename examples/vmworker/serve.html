@@ -1,0 +1,93 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>running</title>
+<pre id="out"></pre>
+<iframe id="frame" style="width:400px;height:120px"></iframe>
+<script>
+// vm.serve(port): a server inside the VM becomes its own origin. Result goes to document.title.
+const out = document.getElementById("out");
+const frame = document.getElementById("frame");
+const note = (s) => { out.textContent += s + "\n"; document.title = "step: " + s; };
+const fail = (why) => { document.title = "FAIL " + why; note("FAIL " + why); throw new Error(why); };
+setTimeout(() => fail("timeout after: " + (out.textContent.trim().split("\n").pop() || "start")), 40000);
+
+function shell(vm) {
+  let next = 1; const pending = new Map();
+  vm.onmessage = ({ data }) => { if (data.type === "result") { pending.get(data.id)?.(data); pending.delete(data.id); } };
+  return (cmd) => new Promise((resolve) => { const id = next++; pending.set(id, resolve); vm.postMessage({ id, cmd }); });
+}
+
+// The served page reports its origin and text to us, since cross-origin content cannot be read directly.
+const page = (label) => `<!doctype html><body>${label}<script>
+  parent.postMessage({ origin: location.origin, text: document.body.firstChild.textContent }, "*");
+<\/script>`;
+
+function loadFrame(url) {
+  return new Promise((resolve) => {
+    const onMessage = (e) => { if (e.source === frame.contentWindow) { removeEventListener("message", onMessage); resolve(e.data); } };
+    addEventListener("message", onMessage);
+    frame.src = url + "?t=" + Math.random();
+  });
+}
+
+(async () => {
+  const root = await VMWorker.getDirectory();
+  try { await root.removeEntry("serve-test", { recursive: true }); } catch {}
+  const site = await root.getDirectoryHandle("serve-test", { create: true });
+  const writeIndex = async (label) => {
+    const w = await (await site.getFileHandle("index.html", { create: true })).createWritable();
+    await w.write(page(label)); await w.close();
+  };
+  note("root ok");
+  await writeIndex("version one");
+  note("index written");
+
+  // network: false, so serving must go over vsock, not the VM's network card.
+  const vm = new VMWorker("worker.sh", { cpus: 1, memory: "256MB", network: false, serialization: "json" });
+  const sh = shell(vm);
+
+  // serve() before anything listens: it must wait, then resolve once the server is up.
+  const t0 = performance.now();
+  let resolvedAt = null;
+  const served = vm.serve(3000).then((url) => { resolvedAt = performance.now(); return url; });
+  await sh("sleep 0.6");
+  if (resolvedAt !== null) fail("serve resolved before the server listened");
+  const startedAt = performance.now();
+  const r = await sh("httpd -p 3000 -h /work/serve-test && echo started");
+  if (r.out !== "started") fail("httpd: " + r.out);
+  const url = await served;
+  note(`serve(3000) -> ${url}, resolved ${Math.round(resolvedAt - startedAt)} ms after httpd started`);
+  if (resolvedAt < startedAt) fail("serve resolved early");
+
+  // Its own origin, and it serves.
+  const first = await loadFrame(url);
+  if (first.text !== "version one") fail("iframe text " + first.text);
+  if (first.origin === location.origin) fail("served page shares the page's origin");
+  if (first.origin !== new URL(url).origin) fail("unexpected origin " + first.origin);
+  note(`iframe loaded, origin ${first.origin} (page is ${location.origin})`);
+
+  // Edit through the page's storage handle, reload, see the change.
+  await writeIndex("version two");
+  const second = await loadFrame(url);
+  if (second.text !== "version two") fail("after edit: " + second.text);
+  note("edit via file handle shows on reload");
+
+  // Many parallel requests. no-cors: we only need them to complete (bodies are opaque here).
+  const t1 = performance.now();
+  await Promise.all(Array.from({ length: 50 }, () => fetch(url + "index.html", { mode: "no-cors", cache: "no-store" })));
+  const t50 = performance.now() - t1;
+  note(`50 parallel requests ${t50.toFixed(0)} ms`);
+
+  // Same port again: same URL.
+  if ((await vm.serve(3000)) !== url) fail("second serve gave a different URL");
+
+  // After terminate, the origin is gone.
+  vm.terminate();
+  await vm.exited;
+  try { await fetch(url, { mode: "no-cors", cache: "no-store" }); fail("served URL still answers after terminate"); }
+  catch (e) { if (e.message.includes("still answers")) throw e; }
+  note("URL closed after terminate");
+
+  document.title = `PASS serve ready=${Math.round(resolvedAt - startedAt)}ms 50req=${t50.toFixed(0)}ms`;
+})().catch((e) => { if (!document.title.startsWith("FAIL")) fail(e.stack || e.message); });
+</script>

@@ -1,0 +1,147 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>running</title>
+<pre id="out"></pre>
+<script>
+// Waits by re-checking on each VM message, not on a timer: background windows throttle timers to 1 s.
+const waiters = new Set();
+const until = (fn) => new Promise((resolve) => {
+  if (fn()) return resolve();
+  const w = () => { if (fn()) { waiters.delete(w); resolve(); } };
+  waiters.add(w);
+});
+const wake = () => { for (const w of [...waiters]) w(); };
+// Structured clone through a VM and back. echo.sh returns every frame unchanged, so a value survives only if
+// the encoder, bridge, framing, guest tty (8-bit clean) and decoder are all right. Result: document.title.
+const out = document.getElementById("out");
+const note = (s) => (out.textContent += s + "\n");
+const fail = (why) => { document.title = "FAIL " + why; note("FAIL " + why); };
+setTimeout(() => fail("timeout"), 30000);
+
+// Deep equality that checks types, identity structure (shared refs, cycles), -0 and NaN.
+function same(a, b, pairs = new Map()) {
+  if (Object.is(a, b)) return true;
+  if (typeof a !== typeof b || a === null || b === null || typeof a !== "object") return false;
+  if (pairs.has(a)) return pairs.get(a) === b;
+  pairs.set(a, b);
+  const ka = Object.prototype.toString.call(a), kb = Object.prototype.toString.call(b);
+  if (ka !== kb) return false;
+  if (ArrayBuffer.isView(a) || a instanceof ArrayBuffer) {
+    const ua = new Uint8Array(a.buffer ?? a, a.byteOffset ?? 0, a.byteLength);
+    const ub = new Uint8Array(b.buffer ?? b, b.byteOffset ?? 0, b.byteLength);
+    return ua.length === ub.length && ua.every((x, i) => x === ub[i]);
+  }
+  if (a instanceof Date) return Object.is(a.getTime(), b.getTime());
+  if (a instanceof RegExp) return a.source === b.source && a.flags === b.flags;
+  if (a instanceof Error) return a.name === b.name && a.message === b.message && same(a.cause, b.cause, pairs);
+  if (a instanceof Map) {
+    if (a.size !== b.size) return false;
+    const ea = [...a], eb = [...b];
+    return ea.every(([k, v], i) => same(k, eb[i][0], pairs) && same(v, eb[i][1], pairs));
+  }
+  if (a instanceof Set) return a.size === b.size && [...a].every((v, i) => same(v, [...b][i], pairs));
+  const keys = Object.keys(a);
+  return keys.length === Object.keys(b).length && keys.every((k) => same(a[k], b[k], pairs));
+}
+
+function sample() {
+  const shared = { tag: "shared" };
+  const cyclic = { name: "cyclic" };
+  cyclic.self = cyclic;
+  const bytes = new Uint8Array(256).map((_, i) => i); // every byte value: proves the tty path is 8-bit clean
+  return {
+    bytes,
+    buffer: bytes.buffer.slice(10, 20),
+    floats: new Float64Array([1.5, NaN, -0, Infinity, -Infinity]),
+    f32: new Float32Array([0.1, 3.25]),
+    i16: new Int16Array([-2, 32767]),
+    u32: new Uint32Array([4294967295]),
+    big64: new BigInt64Array([-9007199254740993n, 1n]),
+    clamped: new Uint8ClampedArray([0, 255]),
+    view: new DataView(new Uint8Array([1, 2, 3]).buffer),
+    date: new Date(1790529433123),
+    badDate: new Date(NaN),
+    regex: /a+(b|c)?$/giu,
+    map: new Map([[1, "one"], [{ k: 2 }, [2]], ["x", new Set([1, "a"])]]),
+    set: new Set([undefined, null, 0]),
+    bigints: [0n, 2n ** 100n, -(2n ** 70n), -1n],
+    numbers: [0, -0, 1, -1, 23, 24, 255, 256, 65535, 65536, 2 ** 32, 2 ** 53 - 1, -(2 ** 53) + 1, 0.1, NaN],
+    strings: ["", "plain", "ünïcödé", "emoji 🧪🐧", "\u0000nul\nline\r\n"],
+    misc: [undefined, null, true, false],
+    error: new TypeError("boom", { cause: { code: 42 } }),
+    twice: [shared, shared],
+    cyclic,
+    wrapper: new String("boxed"),
+  };
+}
+
+
+(async () => {
+  // 1. Codec alone.
+  const v = sample();
+  const local = VMWorker.codec.decode(VMWorker.codec.encode(v));
+  v.wrapper = "boxed"; // wrapper objects clone to their primitive
+  if (!same(v, local)) return fail("codec round trip differs");
+  if (local.twice[0] !== local.twice[1]) return fail("shared reference lost (codec)");
+  if (local.cyclic.self !== local.cyclic) return fail("cycle lost (codec)");
+  note("codec round trip ok");
+
+  // 2. Through the VM.
+  const vm = new VMWorker("echo.sh", { cpus: 1, memory: "256MB", network: false });
+  const inbox = [];
+  vm.onmessage = (e) => { inbox.push(e.data); wake(); };
+  vm.onmessageerror = () => fail("messageerror");
+
+  const t0 = performance.now();
+  vm.postMessage(sample()); // queued before boot
+  await until(() => inbox.length === 1);
+  note(`first echo after ${Math.round(performance.now() - t0)} ms`);
+  const back = inbox[0];
+  if (!same(v, back)) return fail("VM round trip differs");
+  if (back.twice[0] !== back.twice[1] || back.cyclic.self !== back.cyclic) return fail("identity lost (VM)");
+  if (!(back.error instanceof TypeError) || back.error.cause.code !== 42) return fail("error type lost");
+  note("VM round trip ok: typed arrays, Map, Set, Date, RegExp, BigInt, DataView, Error, cycles, shared refs");
+
+  // 3. Transfer detaches the sender's buffer.
+  const moved = new ArrayBuffer(16);
+  vm.postMessage(moved, [moved]);
+  if (moved.byteLength !== 0) return fail("transferred ArrayBuffer not detached");
+  await until(() => inbox.length === 2);
+  if (inbox[1].byteLength !== 16) return fail("transferred buffer wrong size");
+  note("transfer detaches ok");
+
+  // 4. What cannot be cloned throws DataCloneError synchronously, like Worker.postMessage.
+  for (const [label, bad] of [["function", () => 1], ["symbol", Symbol("s")], ["Blob", new Blob(["x"])],
+                              ["SharedArrayBuffer", typeof SharedArrayBuffer === "function" ? new SharedArrayBuffer(8) : null]]) {
+    if (bad === null) { note(`${label}: not available in this page, skipped`); continue; }
+    try { vm.postMessage({ bad }); return fail(`${label} did not throw`); }
+    catch (e) { if (e.name !== "DataCloneError") return fail(`${label} threw ${e.name}`); }
+  }
+  note("DataCloneError ok");
+
+  // 5. Throughput: 8 MB of binary out and back.
+  const big = new Uint8Array(8 * 1024 * 1024);
+  crypto.getRandomValues(big.subarray(0, 65536));
+  const s = performance.now();
+  vm.postMessage(big);
+  await until(() => inbox.length === 3);
+  const ms = performance.now() - s;
+  if (!same(big, inbox[2])) return fail("8 MB payload differs");
+  const mbps = ((2 * 8) / (ms / 1000)).toFixed(0);
+  note(`8 MB round trip ${ms.toFixed(0)} ms (${mbps} MB/s both ways)`);
+
+  // 6. Small-message latency.
+  const rtts = [];
+  for (let i = 0; i < 30; i++) {
+    const n = inbox.length, s2 = performance.now();
+    vm.postMessage({ i, when: new Date(), payload: new Float32Array(16) });
+    await until(() => inbox.length > n);
+    rtts.push(performance.now() - s2);
+  }
+  rtts.sort((a, b) => a - b);
+
+  vm.terminate();
+  document.title = `PASS 8MB_rtt=${ms.toFixed(0)}ms small_p50=${rtts[15].toFixed(1)}ms`;
+  note(document.title);
+})().catch((e) => fail(e.stack || e.message));
+</script>

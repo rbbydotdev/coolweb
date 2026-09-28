@@ -1,0 +1,79 @@
+#!/bin/sh
+# PID 1 for a VMWorker.
+#   hvc0 = console (worker stderr -> page devtools console)
+#   hvc1 = control: guest sends "ready" / "listening <port>" / "exit <code>". Host sends zero or more
+#          "mount <tag> <path>" (virtiofs shares), then "run <serialization> <base64 script>", then at any time
+#          "forward <vsock port> <tcp port>": serve that TCP port to the host once something listens on it.
+#   vsock  = message port: worker stdin/stdout on a vsock stream to host port 1024.
+#            advanced: u32 BE length + CBOR frames. json: one value per line.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
+
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mkdir -p /dev/pts /dev/shm /worker
+mount -t devpts devpts /dev/pts
+mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /run
+hostname vmworker
+
+# coolweb.trace on the kernel command line: trace this script to the console.
+grep -q coolweb.trace /proc/cmdline 2>/dev/null && { exec 2>/dev/hvc0; set -x; }
+
+for m in /lib/coolweb/*.ko; do insmod "$m" 2>/dev/null; done
+
+ip link set lo up
+if ip link set eth0 up 2>/dev/null; then
+  udhcpc -i eth0 -q -n -t 5 -s /usr/share/udhcpc/default.script >/dev/null 2>&1 &
+fi
+
+# Hold each port open for the VM's lifetime and set raw mode on the open fd: hvc resets termios on
+# last close, so stty -F on a closed port does not stick. Raw = no echo, no CR/LF rewriting.
+exec 3<>/dev/hvc1 5<>/dev/hvc0
+# Fully 8-bit clean: no parity, no stripping, no extended input processing.
+for fd in 3 5; do stty raw -echo -iexten -istrip -parenb cs8 <&$fd; done
+
+echo ready >&3
+while read -r cmd a b <&3; do
+  case "$cmd" in
+    mount)
+      mkdir -p "$b" && mount -t virtiofs "$a" "$b" 2>&5 || echo "Mount $b cannot start." >&5
+      ;;
+    run)
+      export VMWORKER_SERIALIZATION="$a"
+      printf '%s' "$b" | base64 -d > /worker/main
+      break
+      ;;
+  esac
+done
+
+chmod +x /worker/main
+# The script runs from /work when the page mounted storage there, like a project directory.
+if mountpoint -q /work 2>/dev/null; then cd /work; else cd /worker; fi
+# After run, control lines keep coming while the worker runs.
+listening() {
+  hex=$(printf '%04X' "$1")
+  awk -v h=":$hex" '$4 == "0A" && substr($2, length($2) - 4) == h { found = 1 } END { exit !found }' \
+    /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+(
+  while read -r cmd a b <&3; do
+    case "$cmd" in
+      forward)
+        # Wait for the worker's server, then accept host connections on vsock and bridge each to it.
+        ( until listening "$b"; do sleep 0.05; done
+          socat "VSOCK-LISTEN:$a,fork,reuseaddr" "TCP:127.0.0.1:$b" 2>&5 &
+          sleep 0.05
+          echo "listening $b" >&3 ) &
+        ;;
+    esac
+  done
+) &
+
+# nofork: socat connects, then execs the worker with the socket as its stdin/stdout. No relay in the path.
+if [ "$(head -c 2 /worker/main)" = '#!' ]; then prog=/worker/main; else prog="sh /worker/main"; fi
+socat VSOCK-CONNECT:2:1024 "EXEC:$prog,nofork" 2>&5 3>&- 5>&-
+echo "exit $?" >&3
+sync
+poweroff -f

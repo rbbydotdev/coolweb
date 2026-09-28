@@ -1,0 +1,35 @@
+<!doctype html><meta charset="utf-8"><title>running</title><pre id="out"></pre><script>
+// How long until a host-side replace (rename over an existing name) is visible inside a running VM?
+// Three cases: replace a regular file's content, replace a symlink with a file, create a new file.
+function shell(vm) {
+  let next = 1; const pending = new Map();
+  vm.onmessage = ({ data }) => { if (data.type === "result") { pending.get(data.id)?.(data); pending.delete(data.id); } };
+  return (cmd) => new Promise((resolve) => { const id = next++; pending.set(id, resolve); vm.postMessage({ id, cmd }); });
+}
+(async () => {
+  const root = await VMWorker.getDirectory();
+  try { await root.removeEntry("coh", { recursive: true }); } catch {}
+  const dir = await root.getDirectoryHandle("coh", { create: true });
+  const put = (name, body) => fetch(dir.url + name, { method: "PUT", body });
+  await put("file.txt", "v1");
+  const vm = new VMWorker("worker.sh", { cpus: 1, memory: "256MB", network: false, serialization: "json" });
+  const sh = shell(vm);
+  await sh("cat /work/coh/file.txt; ln -s /nowhere /work/coh/link");
+  const results = [];
+  for (const [label, name, check] of [["replace content", "file.txt", (o) => o === "v2"],
+                                      ["replace symlink", "link", (o) => o === "v2"],
+                                      ["new file", "new.txt", (o) => o === "v2"]]) {
+    await put(name, "v2");
+    const t = performance.now();
+    let seen = null;
+    for (let i = 0; i < 60; i++) {
+      const r = await sh(`cat /work/coh/${name} 2>&1`);
+      if (check(r.out)) { seen = Math.round(performance.now() - t); break; }
+      await sh("sleep 0.1");
+    }
+    results.push(`${label}=${seen === null ? "never(6s)" : seen + "ms"}`);
+  }
+  vm.terminate();
+  document.title = "PASS " + results.join(" ");
+})().catch((e) => (document.title = "FAIL " + e.message));
+</script>

@@ -1,0 +1,4 @@
+.build/
+guest/cache/
+guest/out/
+.DS_Store

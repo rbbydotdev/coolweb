@@ -1,0 +1,41 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>running</title>
+<pre id="out"></pre>
+<script>
+// Where does an 8 MB message spend its time? Each stage is timed alone; the result goes to document.title.
+const out = document.getElementById("out");
+const note = (s) => (out.textContent += s + "\n");
+const time = (f) => { const t = performance.now(); const r = f(); return [performance.now() - t, r]; };
+const med = (xs) => xs.sort((a, b) => a - b)[xs.length >> 1];
+
+(async () => {
+  const big = new Uint8Array(8 * 1024 * 1024).map((_, i) => i * 31);
+  const { encode, decode } = VMWorker.codec;
+  const r = { enc: [], dec: [], b64: [], unb64: [], rtt: [] };
+  for (let i = 0; i < 5; i++) {
+    const [enc, bytes] = time(() => encode(big));
+    const [b64, s] = time(() => bytes.toBase64 ? bytes.toBase64() : null);
+    const [unb64, back] = time(() => Uint8Array.fromBase64 ? Uint8Array.fromBase64(s) : null);
+    const [dec] = time(() => decode(back));
+    r.enc.push(enc); r.b64.push(b64); r.unb64.push(unb64); r.dec.push(dec);
+  }
+
+  const vm = new VMWorker("echo.sh", { cpus: 1, memory: "256MB", network: false });
+  let resolve;
+  vm.onmessage = () => resolve();
+  vm.postMessage(1);
+  await new Promise((res) => (resolve = res));
+  for (let i = 0; i < 5; i++) {
+    const t = performance.now();
+    vm.postMessage(big);
+    await new Promise((res) => (resolve = res));
+    r.rtt.push(performance.now() - t);
+  }
+  vm.terminate();
+
+  const m = Object.fromEntries(Object.entries(r).map(([k, v]) => [k, med(v).toFixed(0)]));
+  note(JSON.stringify(m));
+  document.title = `PASS enc=${m.enc} b64=${m.b64} unb64=${m.unb64} dec=${m.dec} total_rtt=${m.rtt}`;
+})().catch((e) => (document.title = "FAIL " + e.message));
+</script>

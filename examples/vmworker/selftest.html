@@ -1,0 +1,72 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>running</title>
+<pre id="out"></pre>
+<script>
+// Waits by re-checking on each VM message, not on a timer: background windows throttle timers to 1 s.
+const waiters = new Set();
+const until = (fn) => new Promise((resolve) => {
+  if (fn()) return resolve();
+  const w = () => { if (fn()) { waiters.delete(w); resolve(); } };
+  waiters.add(w);
+});
+const wake = () => { for (const w of [...waiters]) w(); };
+// Checks the VMWorker API end to end. Result goes to document.title: "PASS ..." or "FAIL ...".
+const out = document.getElementById("out");
+const note = (s) => (out.textContent += s + "\n");
+const fail = (why) => { document.title = "FAIL " + why; note("FAIL " + why); };
+setTimeout(() => fail("timeout"), 20000);
+
+(async () => {
+  if (typeof VMWorker !== "function") return fail("VMWorker missing");
+  const t0 = performance.now();
+  const vm = new VMWorker("worker.sh", { cpus: 1, memory: "256MB", network: false, serialization: "json" });
+
+  // Posted before boot: must be queued, not dropped.
+  vm.postMessage({ id: 1, cmd: "nproc" });
+
+  const replies = new Map();
+  let ready = null;
+  vm.onmessage = ({ data }) => {
+    if (data.type === "ready") ready = data;
+    if (data.type === "result") replies.set(data.id, data);
+    wake();
+  };
+  const exited = new Promise((r) => (vm.onexit = r));
+
+  await until(() => ready && replies.has(1));
+  const bootMs = Math.round(performance.now() - t0);
+  note(`ready ${JSON.stringify(ready)} in ${bootMs} ms`);
+  if (ready.cpus !== 1) return fail(`cpus ${ready.cpus} != 1`);
+  if (ready.memMB > 256) return fail(`memMB ${ready.memMB} > 256`);
+  if (replies.get(1).out.trim() !== "1") return fail(`nproc said ${replies.get(1).out}`);
+
+  // Web Worker talks to the VM over vm.connect().
+  const src = `onmessage = (e) => { const p = e.data.vm;
+    p.onmessage = (m) => { if (m.data.id === 7) postMessage(m.data); };
+    p.postMessage({ id: 7, cmd: "echo from-web-worker" }); };`;
+  const ww = new Worker(URL.createObjectURL(new Blob([src], { type: "text/javascript" })));
+  const port = vm.connect();
+  ww.postMessage({ vm: port }, [port]);
+  const wwReply = await new Promise((r) => (ww.onmessage = (e) => r(e.data)));
+  note(`web worker got ${JSON.stringify(wwReply)}`);
+  if (wwReply.out !== "from-web-worker") return fail("web worker reply " + wwReply.out);
+
+  // Round-trip latency, 20 sequential messages.
+  const rtts = [];
+  for (let i = 100; i < 120; i++) {
+    const s = performance.now();
+    vm.postMessage({ id: i, cmd: "true" });
+    await until(() => replies.has(i));
+    rtts.push(performance.now() - s);
+  }
+  rtts.sort((a, b) => a - b);
+  const p50 = rtts[10].toFixed(1);
+
+  vm.terminate();
+  const e = await exited;
+  note(`exit event code=${e.code}`);
+  document.title = `PASS boot=${bootMs}ms rtt_p50=${p50}ms`;
+  note(document.title);
+})().catch((e) => fail(e.message));
+</script>

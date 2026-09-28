@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bun in a VMWorker</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #111114; --panel: #18181c; --panel-2: #1f1f24; --line: #2b2b31; --fg: #ececf1; --muted: #8e8e99;
+    --accent: #f9a8d4; --accent-ink: #1a0f14; --ok: #7ee2a8; --err: #ff8a7a; --warn: #f5c776;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--fg); font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Inter", sans-serif;
+    display: grid; grid-template-rows: auto 1fr; }
+
+  header { display: flex; align-items: center; gap: 14px; padding: 12px 18px; border-bottom: 1px solid var(--line); }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 650; font-size: 14px; letter-spacing: -0.01em; }
+  .brand .logo { width: 26px; height: 26px; border-radius: 8px; background: #fbf0df; display: grid; place-items: center; font-size: 16px; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip { font: 11.5px/1 var(--mono); color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 5px 9px;
+    display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .chip b { color: var(--fg); font-weight: 500; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+  .dot.busy { background: var(--warn); animation: pulse 1s infinite; }
+  .dot.ok { background: var(--ok); }
+  .dot.err { background: var(--err); }
+  @keyframes pulse { 50% { opacity: 0.35; } }
+  .spacer { flex: 1; }
+  button { font: 500 12.5px/1 inherit; font-family: inherit; color: var(--fg); background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 12px; cursor: pointer; display: inline-flex; gap: 8px; align-items: center; }
+  button:hover:not(:disabled) { border-color: #3b3b44; background: #26262c; }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+  button.primary:hover:not(:disabled) { background: #fbb9dd; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  kbd { font: 10.5px var(--mono); opacity: 0.7; }
+
+  main { display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr); gap: 12px; padding: 12px; min-height: 0; }
+  .col { display: grid; gap: 12px; min-height: 0; }
+  .col.right { grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; display: grid;
+    grid-template-rows: auto minmax(0, 1fr); min-height: 0; overflow: hidden; }
+  .bar { display: flex; align-items: center; gap: 8px; padding: 0 10px; height: 38px; border-bottom: 1px solid var(--line);
+    color: var(--muted); font-size: 12px; }
+  .tabs { display: flex; gap: 2px; height: 100%; }
+  .tab { font: 12px var(--mono); color: var(--muted); padding: 0 12px; display: flex; align-items: center; border-bottom: 2px solid transparent;
+    cursor: pointer; user-select: none; }
+  .tab.active { color: var(--fg); border-bottom-color: var(--accent); }
+  .tab .saved { width: 6px; height: 6px; border-radius: 50%; margin-left: 8px; background: transparent; }
+  .tab.dirty .saved { background: var(--warn); }
+
+  textarea { width: 100%; height: 100%; resize: none; border: 0; outline: 0; background: transparent; color: var(--fg);
+    font: 12.5px/1.6 var(--mono); padding: 14px 16px; tab-size: 2; white-space: pre; }
+
+  .url { font: 12px var(--mono); color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+    padding: 4px 8px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  iframe { width: 100%; height: 100%; border: 0; background: #fff; }
+  .empty { display: grid; place-items: center; color: var(--muted); text-align: center; padding: 24px; }
+  .empty p { margin: 4px 0; }
+
+  #log { margin: 0; padding: 10px 14px; overflow: auto; font: 12px/1.55 var(--mono); white-space: pre-wrap; word-break: break-word; }
+  #log .cmd { color: var(--accent); }
+  #log .sys { color: var(--muted); }
+  #log .err { color: var(--err); }
+  #log .done { color: var(--ok); }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><span class="logo">🥟</span>Bun in a VMWorker</div>
+  <div class="chips">
+    <span class="chip"><span class="dot busy" id="vmDot"></span><span id="vmChip">booting VM…</span></span>
+    <span class="chip">Bun <b id="bunChip">—</b></span>
+  </div>
+  <span class="spacer"></span>
+  <button id="run" class="primary" disabled>Run <kbd>⌘↵</kbd></button>
+  <button id="serve" disabled>Serve server.ts <kbd>⌘S</kbd></button>
+  <button id="stop" disabled>Stop server</button>
+</header>
+
+<main>
+  <section class="card">
+    <div class="bar"><div class="tabs" id="tabs"></div><span class="spacer"></span><span id="where">/work/bun-demo</span></div>
+    <textarea id="editor" spellcheck="false" autocomplete="off" autocapitalize="off" aria-label="Editor"></textarea>
+  </section>
+  <div class="col right">
+    <section class="card">
+      <div class="bar"><span>Preview</span><span class="url" id="url">not serving</span><button id="reload" disabled>Reload</button></div>
+      <div id="previewBox" class="empty"><div><p>Press <b>Serve server.ts</b> to start <code>Bun.serve()</code> in the VM.</p>
+        <p>It shows here from its own origin via <code>vm.serve(3000)</code>.</p></div></div>
+    </section>
+    <section class="card">
+      <div class="bar"><span>Output</span><span class="spacer"></span><button id="clear">Clear</button></div>
+      <pre id="log"></pre>
+    </section>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const autotest = new URLSearchParams(location.search).has("autotest");
+
+// MARK: Files. They live in this site's VM storage, so edits persist and the VM sees them at /work/bun-demo.
+
+const DEFAULT_FILES = {
+  "hello.ts": `// Runs in Bun, inside a Linux VM, started by this web page.
+const started = performance.now();
+
+function countPrimes(n: number): number {
+  const composite = new Uint8Array(n + 1);
+  let count = 0;
+  for (let i = 2; i <= n; i++) {
+    if (composite[i]) continue;
+    count++;
+    for (let j = i * i; j <= n; j += i) composite[j] = 1;
+  }
+  return count;
+}
+
+console.log(\`Bun \${Bun.version} on \${process.platform}/\${process.arch}, \${navigator.hardwareConcurrency} CPUs\`);
+console.log(\`primes below 10 million: \${countPrimes(10_000_000)}\`);
+console.log(\`took \${(performance.now() - started).toFixed(1)} ms\`);
+`,
+  "server.ts": `// Bun.serve() inside the VM. The page shows it in an iframe via vm.serve(3000).
+const message = "Hello from Bun";
+let hits = 0;
+
+Bun.serve({
+  port: 3000,
+  fetch(req) {
+    hits++;
+    const { pathname } = new URL(req.url);
+    if (pathname === "/api") {
+      return Response.json({ message, hits, bun: Bun.version, time: new Date() },
+        { headers: { "Access-Control-Allow-Origin": "*" } });
+    }
+    return new Response(\`<!doctype html>
+<body style="font: 16px system-ui; margin: 0; padding: 28px; background: #fdf6ec; color: #2b1d12">
+  <h1 style="margin-top: 0">\${message} 🥟</h1>
+  <p>Bun \${Bun.version} in a Linux VM. Request #\${hits}.</p>
+  <pre id="api" style="background: #fff; padding: 12px; border-radius: 8px"></pre>
+  <script>fetch("/api").then(r => r.json()).then(d => api.textContent = JSON.stringify(d, null, 2))<\\/script>
+</body>\`, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+  },
+});
+
+console.log("listening on :3000");
+`,
+};
+
+let dir = null;
+const files = {};         // name -> { handle, text, dirty }
+let active = "hello.ts";
+
+async function loadFiles() {
+  const root = await VMWorker.getDirectory();
+  dir = await root.getDirectoryHandle("bun-demo", { create: true });
+  for (const [name, text] of Object.entries(DEFAULT_FILES)) {
+    let handle;
+    try {
+      if (autotest) throw new Error("autotest starts from the default files");
+      handle = await dir.getFileHandle(name);
+      files[name] = { handle, text: await (await handle.getFile()).text(), dirty: false };
+    } catch {
+      handle = await dir.getFileHandle(name, { create: true });
+      files[name] = { handle, text, dirty: true };
+      await save(name);
+    }
+  }
+  renderTabs();
+  $("editor").value = files[active].text;
+}
+
+async function save(name) {
+  const f = files[name];
+  if (!f.dirty) return;
+  const w = await f.handle.createWritable();
+  await w.write(f.text);
+  await w.close();
+  f.dirty = false;
+  renderTabs();
+}
+
+function renderTabs() {
+  $("tabs").replaceChildren(...Object.keys(files).map((name) => {
+    const t = document.createElement("div");
+    t.className = "tab" + (name === active ? " active" : "") + (files[name].dirty ? " dirty" : "");
+    t.textContent = name;
+    t.append(Object.assign(document.createElement("span"), { className: "saved" }));
+    t.onclick = () => { active = name; $("editor").value = files[name].text; renderTabs(); };
+    return t;
+  }));
+}
+
+$("editor").addEventListener("input", () => { files[active].text = $("editor").value; files[active].dirty = true; renderTabs(); });
+$("editor").addEventListener("keydown", (e) => {
+  if (e.key === "Tab") {
+    e.preventDefault();
+    const el = e.target, s = el.selectionStart;
+    el.setRangeText("  ", s, el.selectionEnd, "end");
+    el.dispatchEvent(new Event("input"));
+  }
+});
+
+// MARK: Output
+
+function log(text, cls = "") {
+  const span = document.createElement("span");
+  if (cls) span.className = cls;
+  span.textContent = text + "\n";
+  $("log").append(span);
+  $("log").scrollTop = $("log").scrollHeight;
+}
+$("clear").onclick = () => $("log").replaceChildren();
+
+// MARK: The VM
+
+const t0 = performance.now();
+const vm = new VMWorker("runner.sh", { cpus: 4, memory: "2GB", network: true, serialization: "json" });
+let nextJob = 1;
+const jobs = new Map();   // id -> { onLine, resolve, started }
+let booted;
+const bootedP = new Promise((r) => (booted = r));
+
+vm.onmessage = ({ data }) => {
+  if (data.type === "ready") return booted(performance.now() - t0);
+  const job = jobs.get(data.id);
+  if (!job) return;
+  if (data.type === "out") job.onLine(data.line);
+  if (data.type === "exit") { jobs.delete(data.id); job.resolve({ code: data.code, ms: performance.now() - job.started }); }
+};
+vm.onerror = (e) => { log(e.message, "err"); setVM("err", "VM error"); };
+
+/** Runs a shell command in the VM. Output lines stream to onLine; resolves with { code, ms }. */
+function run(cmd, onLine = (l) => log(l)) {
+  const id = nextJob++;
+  const bytes = new TextEncoder().encode(cmd);
+  const done = new Promise((resolve) => jobs.set(id, { onLine, resolve, started: performance.now() }));
+  vm.postMessage({ id, run: btoa(String.fromCharCode(...bytes)) });
+  return { id, done };
+}
+const kill = (id) => vm.postMessage({ id, kill: 1 });
+
+function setVM(state, text) { $("vmDot").className = "dot " + state; $("vmChip").innerHTML = text; }
+
+const INSTALL = `set -e
+if [ -x /work/.bun/bin/bun ]; then echo "Bun $(bun --version) found in this site's storage."; exit 0; fi
+for i in $(seq 1 50); do ip -4 addr show eth0 | grep -q inet && break; sleep 0.1; done
+mkdir -p /work/.bun/bin /work/.bun/tmp
+echo "Downloading Bun (linux arm64, musl) from github.com/oven-sh/bun…"
+wget -q -O /work/.bun/tmp/bun.zip https://github.com/oven-sh/bun/releases/latest/download/bun-linux-aarch64-musl.zip
+echo "Unpacking…"
+unzip -q -o /work/.bun/tmp/bun.zip -d /work/.bun/tmp
+mv /work/.bun/tmp/bun-linux-aarch64-musl/bun /work/.bun/bin/bun
+rm -rf /work/.bun/tmp
+echo "Installed Bun $(bun --version)."`;
+
+let bunVersion = null;
+async function install() {
+  log("$ install bun", "cmd");
+  const r = await run(INSTALL).done;
+  if (r.code !== 0) { log(`install failed (exit ${r.code})`, "err"); throw new Error("install failed"); }
+  bunVersion = (await capture("bun --version")).trim();
+  $("bunChip").textContent = bunVersion;
+  log(`ready in ${(r.ms / 1000).toFixed(1)} s`, "done");
+  return r.ms;
+}
+
+async function capture(cmd) {
+  let out = "";
+  await run(cmd, (l) => (out += l + "\n")).done;
+  return out;
+}
+
+// MARK: Actions
+
+let busy = false;
+async function runActive() {
+  if (busy) return;
+  busy = true;
+  $("run").disabled = true;
+  try {
+    const name = active === "server.ts" ? "hello.ts" : active;
+    await save(name);
+    log(`$ bun run ${name}`, "cmd");
+    const lines = [];
+    const r = await run(`cd /work/bun-demo && bun run ${name}`, (l) => { lines.push(l); log(l); }).done;
+    log(`exit ${r.code} · ${r.ms.toFixed(0)} ms`, r.code ? "err" : "done");
+    return { ...r, lines };
+  } finally {
+    busy = false;
+    $("run").disabled = false;
+  }
+}
+
+let server = null;        // { id, done }
+let previewURL = null;
+
+async function serve() {
+  await save("server.ts");
+  if (server) { kill(server.id); await server.done; }
+  log("$ bun run server.ts", "cmd");
+  let listening;
+  const up = new Promise((r) => (listening = r));
+  server = run("cd /work/bun-demo && exec bun run server.ts", (l) => { log(l); if (/listening/.test(l)) listening(); });
+  server.done.then((r) => { log(`server exited (${r.code})`, r.code && r.code !== 143 ? "err" : "sys"); server = null; $("stop").disabled = true; });
+  $("stop").disabled = false;
+  const t = performance.now();
+  previewURL = await vm.serve(3000);   // resolves once :3000 is listening in the VM
+  await up;
+  log(`serving at ${previewURL} (${(performance.now() - t).toFixed(0)} ms)`, "done");
+  showPreview();
+  return previewURL;
+}
+
+function showPreview() {
+  $("url").textContent = previewURL;
+  $("reload").disabled = false;
+  let frame = $("previewBox").querySelector("iframe");
+  if (!frame) {
+    frame = document.createElement("iframe");
+    $("previewBox").className = "";
+    $("previewBox").replaceChildren(frame);
+  }
+  frame.src = previewURL + "?t=" + Date.now();
+}
+
+$("run").onclick = runActive;
+$("serve").onclick = serve;
+$("stop").onclick = () => server && kill(server.id);
+$("reload").onclick = showPreview;
+addEventListener("keydown", (e) => {
+  if (!(e.metaKey || e.ctrlKey) || $("run").disabled) return;
+  if (e.key === "Enter") { e.preventDefault(); runActive(); }
+  if (e.key === "s") { e.preventDefault(); active === "server.ts" ? serve() : save(active); }
+});
+
+// MARK: Start
+
+(async () => {
+  await loadFiles();
+  const bootMs = await bootedP;
+  setVM("ok", `VM <b>4 CPU · 2 GB</b> · booted in ${bootMs.toFixed(0)} ms`);
+  log(`VM booted in ${bootMs.toFixed(0)} ms`, "sys");
+  const installMs = await install();
+  for (const b of ["run", "serve"]) $(b).disabled = false;
+  if (autotest) await selfTest(bootMs, installMs);
+})().catch((e) => {
+  log(e.message, "err");
+  const tail = $("log").textContent.trim().split("\n").slice(-4).join(" | ");
+  document.title = "FAIL " + e.message + " :: " + tail;
+});
+
+// MARK: ?autotest — drives the page and reports through document.title (used by headless test runs).
+
+async function selfTest(bootMs, installMs) {
+  const fail = (why) => { throw new Error(why); };
+  active = "hello.ts";
+  const r = await runActive();
+  if (r.code !== 0 || !r.lines.includes("primes below 10 million: 664579")) fail("hello.ts: " + r.lines.join(" | "));
+  const url = await serve();
+  const api = await (await fetch(url + "api")).json();
+  if (api.message !== "Hello from Bun" || api.bun !== bunVersion) fail("api " + JSON.stringify(api));
+  // Edit server.ts like a user would, serve again, and see the change.
+  files["server.ts"].text = files["server.ts"].text.replace('"Hello from Bun"', '"Edited in the page"');
+  files["server.ts"].dirty = true;
+  await serve();
+  const api2 = await (await fetch(url + "api")).json();
+  if (api2.message !== "Edited in the page") fail("after edit " + JSON.stringify(api2));
+  kill(server.id);
+  document.title = `PASS boot=${bootMs.toFixed(0)}ms install=${(installMs / 1000).toFixed(1)}s hello=${r.ms.toFixed(0)}ms bun=${bunVersion}`;
+}
+</script>
+</body>
+</html>

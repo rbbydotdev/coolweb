@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>VMWorker</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbfa; --fg: #1d1d1f; --muted: #6e6e73; --line: #e3e3e0; --panel: #fff;
+    --code: #f3f3f1; --accent: #6d4aff; --ok: #1f8a4c; --err: #c4321c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #1b1b1d; --fg: #ececf0; --muted: #9a9aa3; --line: #2e2e33; --panel: #222226;
+      --code: #2a2a2f; --accent: #a58bff; --ok: #5ccf8a; --err: #ff7a66; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Inter", sans-serif; }
+  main { max-width: 880px; margin: 0 auto; padding: 48px 28px 64px; }
+  h1 { font-size: 30px; letter-spacing: -0.02em; margin: 0 0 6px; }
+  .lede { color: var(--muted); margin: 0 0 24px; max-width: 62ch; }
+  code, pre, .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12.5px; }
+  pre.sample { background: var(--code); border-radius: 10px; padding: 14px 16px; margin: 0 0 28px; overflow-x: auto; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  label { color: var(--muted); font-size: 13px; display: flex; gap: 6px; align-items: center; }
+  select, input[type=text] { font: inherit; color: var(--fg); background: var(--bg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 6px 10px; }
+  input[type=text] { flex: 1; min-width: 220px; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 13px; }
+  button { font: inherit; font-weight: 500; border-radius: 8px; padding: 6px 14px; cursor: pointer;
+    border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: 0.45; cursor: default; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .chips button { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; font-weight: 400;
+    padding: 3px 9px; border-radius: 999px; }
+  .status { font-size: 13px; color: var(--muted); margin-top: 12px; }
+  .status b { color: var(--fg); font-weight: 600; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--line); margin-right: 6px; }
+  .dot.on { background: var(--ok); }
+  #log { list-style: none; margin: 0; padding: 0; max-height: 420px; overflow-y: auto; }
+  #log li { border-top: 1px solid var(--line); padding: 10px 2px; }
+  #log li:first-child { border-top: 0; }
+  #log .meta { font-size: 12px; color: var(--muted); display: flex; gap: 10px; }
+  #log .from { font-weight: 600; color: var(--accent); }
+  #log .err { color: var(--err); }
+  #log pre { margin: 6px 0 0; white-space: pre-wrap; word-break: break-word; }
+  .empty { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>VMWorker</h1>
+  <p class="lede">A Worker whose script runs in its own Linux VM. The script reads messages on stdin and posts
+    them on stdout. CPU and memory limits are set per VM.</p>
+
+  <pre class="sample">const vm = new VMWorker("worker.sh", { cpus: 2, memory: "512MB", serialization: "json" });
+vm.onmessage = (e) => console.log(e.data);
+vm.postMessage({ id: 1, cmd: "uname -a" });
+
+webWorker.postMessage({ vm: vm.connect() }, [port]); // a Web Worker talks to the VM directly</pre>
+
+  <section class="panel">
+    <div class="row">
+      <label>CPUs <select id="cpus"><option>1</option><option selected>2</option><option>4</option></select></label>
+      <label>Memory <select id="memory"><option>256MB</option><option selected>512MB</option><option>1GB</option><option>2GB</option></select></label>
+      <label><input type="checkbox" id="network" checked> Network</label>
+      <span style="flex:1"></span>
+      <button id="start" class="primary">Start VMWorker</button>
+      <button id="stop" disabled>Terminate</button>
+    </div>
+    <div class="status" id="status"><span class="dot"></span>No VM running.</div>
+  </section>
+
+  <section class="panel">
+    <form class="row" id="form">
+      <input type="text" id="cmd" value="uname -a" autocomplete="off" spellcheck="false" aria-label="Command">
+      <button type="submit" id="send" disabled>Post from page</button>
+      <button type="button" id="viaWorker" disabled>Post from Web Worker</button>
+    </form>
+    <div class="chips" id="chips"></div>
+  </section>
+
+  <section class="panel">
+    <ul id="log"><li class="empty">Messages show here.</li></ul>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const presets = [
+  "uname -a",
+  "nproc && free -m",
+  "cat /proc/loadavg",
+  "ip -4 addr show eth0",
+  "apk update",
+  "apk add -q python3 && python3 -c 'import sys; print(sys.version)'",
+];
+for (const p of presets) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.textContent = p;
+  b.onclick = () => { $("cmd").value = p; $("cmd").focus(); };
+  $("chips").append(b);
+}
+
+let vm = null, webWorker = null, nextId = 1, t0 = 0;
+const sent = new Map();
+
+function log(from, text, meta = "", isError = false) {
+  const empty = $("log").querySelector(".empty");
+  if (empty) empty.remove();
+  const li = document.createElement("li");
+  li.innerHTML = `<div class="meta"><span class="from"></span><span class="m"></span></div><pre class="mono"></pre>`;
+  li.querySelector(".from").textContent = from;
+  li.querySelector(".m").textContent = meta;
+  const pre = li.querySelector("pre");
+  pre.textContent = text;
+  if (isError) pre.classList.add("err");
+  $("log").prepend(li);
+}
+
+function setRunning(on, text) {
+  $("start").disabled = on;
+  $("stop").disabled = !on;
+  $("send").disabled = !on;
+  $("viaWorker").disabled = !on;
+  $("status").innerHTML = `<span class="dot ${on ? "on" : ""}"></span>${text}`;
+}
+
+$("start").onclick = () => {
+  t0 = performance.now();
+  // worker.sh is a shell script, so it speaks line-per-message JSON instead of the default structured clone.
+  vm = new VMWorker("worker.sh", {
+    cpus: +$("cpus").value, memory: $("memory").value, network: $("network").checked, serialization: "json",
+  });
+  setRunning(true, "Booting…");
+
+  vm.onmessage = ({ data }) => {
+    if (data.type === "ready") {
+      const ms = Math.round(performance.now() - t0);
+      setRunning(true, `<b>${vm.name}</b> · Linux ${data.kernel} ${data.arch} · ${data.cpus} CPU · ${data.memMB} MB · ready in <b>${ms} ms</b>`);
+      log("vm", JSON.stringify(data), `boot to first message ${ms} ms`);
+    } else if (data.type === "result" && sent.has(data.id)) {
+      const rtt = (performance.now() - sent.get(data.id)).toFixed(1);
+      sent.delete(data.id);
+      log("page ← vm", data.out || "(no output)", `#${data.id} · exit ${data.code} · ${rtt} ms`, data.code !== 0);
+    }
+  };
+  vm.onerror = (e) => log("vm", e.message, "error", true);
+  vm.onexit = (e) => {
+    setRunning(false, `VM stopped${e.code != null ? ` with exit code ${e.code}` : ""}.`);
+    webWorker?.terminate();
+    webWorker = null;
+    vm = null;
+  };
+
+  webWorker = new Worker("web-worker.js");
+  const port = vm.connect();
+  webWorker.postMessage({ vm: port }, [port]);
+  webWorker.onmessage = ({ data }) =>
+    log("web worker ← vm", data.out || "(no output)", `#${data.id} · exit ${data.code} · ${data.rttMs} ms`, data.code !== 0);
+};
+
+$("stop").onclick = () => vm?.terminate();
+
+$("form").onsubmit = (e) => {
+  e.preventDefault();
+  const cmd = $("cmd").value.trim();
+  if (!vm || !cmd) return;
+  const id = nextId++;
+  sent.set(id, performance.now());
+  vm.postMessage({ id, cmd });
+};
+
+$("viaWorker").onclick = () => {
+  const cmd = $("cmd").value.trim();
+  if (webWorker && cmd) webWorker.postMessage({ cmd });
+};
+</script>
+</body>
+</html>

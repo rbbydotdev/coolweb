@@ -1,0 +1,129 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>running</title>
+<pre id="out"></pre>
+<script>
+// VM files from the page, from a Web Worker and from inside the VM, all on one origin storage.
+// Result goes to document.title: "PASS ..." or "FAIL ...".
+const out = document.getElementById("out");
+const note = (s) => (out.textContent += s + "\n");
+const fail = (why) => { document.title = "FAIL " + why; note("FAIL " + why); throw new Error(why); };
+setTimeout(() => fail("timeout"), 40000);
+
+// Runs shell commands in a VMWorker (worker.sh, json) and resolves with {code, out}.
+function shell(vm) {
+  let next = 1;
+  const pending = new Map();
+  vm.onmessage = ({ data }) => { if (data.type === "result") { pending.get(data.id)?.(data); pending.delete(data.id); } };
+  return (cmd) => new Promise((resolve) => { const id = next++; pending.set(id, resolve); vm.postMessage({ id, cmd }); });
+}
+
+const text = async (fileHandle) => (await fileHandle.getFile()).text();
+
+(async () => {
+  const t0 = performance.now();
+  // 1. Page writes through the handle API.
+  const root = await VMWorker.getDirectory();
+  if (root.kind !== "directory") fail("root kind");
+  try { await root.removeEntry("files-test", { recursive: true }); } catch (e) { if (e.name !== "NotFoundError") throw e; }
+  const dir = await root.getDirectoryHandle("files-test", { create: true });
+  const f = await (await dir.getFileHandle("from-page.txt", { create: true })).createWritable();
+  await f.write("hello ");
+  await f.write({ type: "write", position: 6, data: new TextEncoder().encode("from the page") });
+  await f.close();
+  const bin = await (await dir.getFileHandle("bytes.bin", { create: true })).createWritable();
+  await bin.write(new Uint8Array(256).map((_, i) => i));
+  await bin.close();
+  note("page wrote files");
+
+  // 2. The VM sees them at /work (default mount), and writes back.
+  const vm = new VMWorker("worker.sh", { cpus: 1, memory: "256MB", network: false, serialization: "json" });
+  const sh = shell(vm);
+  let r = await sh("cat /work/files-test/from-page.txt");
+  if (r.out !== "hello from the page") fail(`VM read ${JSON.stringify(r.out)}`);
+  r = await sh("od -An -tu1 -N4 -j252 /work/files-test/bytes.bin | tr -s ' '");
+  if (r.out.trim() !== "252 253 254 255") fail(`VM binary read ${JSON.stringify(r.out)}`);
+  r = await sh("pwd; echo from-vm > /work/files-test/from-vm.txt && mkdir /work/files-test/sub && printf 'deep' > /work/files-test/sub/deep.txt && ln -s / /work/files-test/escape && ln -s /tmp/coolweb-escape-probe /work/files-test/dangling");
+  if (r.code !== 0) fail(`VM write: ${r.out}`);
+  if (r.out.split("\n")[0] !== "/work") fail(`VM cwd ${r.out}`);
+  note(`VM read page files and wrote its own (${Math.round(performance.now() - t0)} ms)`);
+
+  // 3. Escapes are refused with 403 / NotAllowedError, not some other failure. "dangling" points at
+  //    /tmp/coolweb-escape-probe, which IS writable on the host, so a missing check would create it (the harness
+  //    checks the host /tmp afterwards).
+  for (const [label, url, init] of [
+    ["symlink to / (read)", dir.url + "escape/etc/hosts", {}],
+    ["symlink to / (list)", dir.url + "escape/", {}],
+    ["encoded ..", root.url + "..%2F..%2F..%2Fetc%2Fhosts", {}],
+  ]) {
+    const res = await fetch(url, init);
+    if (res.ok) fail(`${label}: status ${res.status}, read ${(await res.text()).slice(0, 40)}`);
+  }
+  // Writing to the dangling link replaces the link itself with a file in storage; nothing lands outside
+  // (the harness checks the host /tmp for the probe file).
+  const put = await fetch(dir.url + "dangling", { method: "PUT", body: "stayed inside" });
+  if (!put.ok) fail(`dangling write: status ${put.status}`);
+  // Replacing a link with a file changes the entry's type; the guest's virtiofs cache shows it after ~1 s.
+  // (Content replaces and new files show in a few ms: see coherence.html.)
+  for (let i = 0; i < 30; i++) {
+    r = await sh("test -L /work/files-test/dangling && echo link || cat /work/files-test/dangling");
+    if (r.out === "stayed inside") break;
+    await sh("sleep 0.1");
+  }
+  if (r.out !== "stayed inside") fail(`dangling write: VM sees ${JSON.stringify(r.out)}`);
+  try { await dir.getDirectoryHandle("escape"); fail("handle to symlink escaped"); }
+  catch (e) { if (e.name !== "NotAllowedError") fail(`handle to symlink: ${e.name}`); }
+  note("escapes refused with 403");
+
+  // 4. The page sees the VM's writes.
+  const names = [];
+  for await (const [name, h] of dir) names.push(`${name}:${h.kind}`);
+  // "escape" (the VM's link to /) is not listed: it cannot be opened. "dangling" is a plain file by now.
+  const want = ["bytes.bin:file", "dangling:file", "from-page.txt:file", "from-vm.txt:file", "sub:directory"];
+  if (names.join() !== want.join()) fail(`listing ${names.join()}`);
+  if ((await text(await dir.getFileHandle("from-vm.txt"))) !== "from-vm\n") fail("page read VM file");
+  const deep = await (await dir.getDirectoryHandle("sub")).getFileHandle("deep.txt");
+  if ((await dir.resolve(deep)).join("/") !== "sub/deep.txt") fail("resolve");
+  note("page read VM files");
+
+  // 5. A Web Worker gets the handle by postMessage and edits files directly.
+  const wsrc = `onmessage = async (e) => {
+    try {
+      importScripts(new URL("/vmfs.js", e.data.dir.url));
+      const dir = VMFileSystemHandle.from(e.data.dir);
+      const vmText = await (await (await dir.getFileHandle("from-vm.txt")).getFile()).text();
+      const w = await (await dir.getFileHandle("from-worker.txt", { create: true })).createWritable();
+      await w.write("worker saw " + vmText.trim());
+      await w.close();
+      const raw = await (await fetch(dir.url + "sub/deep.txt")).text();
+      postMessage({ ok: true, raw });
+    } catch (err) { postMessage({ ok: false, err: String(err) }); }
+  };`;
+  const ww = new Worker(URL.createObjectURL(new Blob([wsrc], { type: "text/javascript" })));
+  ww.postMessage({ dir });
+  const wr = await new Promise((res) => (ww.onmessage = (e) => res(e.data)));
+  if (!wr.ok) fail("web worker: " + wr.err);
+  if (wr.raw !== "deep") fail("web worker plain fetch " + wr.raw);
+  r = await sh("cat /work/files-test/from-worker.txt");
+  if (r.out !== "worker saw from-vm") fail(`VM read worker file ${JSON.stringify(r.out)}`);
+  note("web worker read and wrote VM files; VM saw the write");
+
+  // 6. Custom mounts: only the chosen handle, at the chosen path.
+  vm.terminate();
+  const sub = await dir.getDirectoryHandle("sub");
+  const vm2 = new VMWorker("worker.sh", { cpus: 1, memory: "256MB", network: false, serialization: "json", mounts: { "/data": sub } });
+  const sh2 = shell(vm2);
+  r = await sh2("ls /data; test -d /work && echo has-work || echo no-work; pwd");
+  if (r.out !== "deep.txt\nno-work\n/worker") fail(`custom mount ${JSON.stringify(r.out)}`);
+  vm2.terminate();
+  // A handle URL with a token this origin does not own must not mount.
+  const forged = { kind: "directory", url: root.url.replace(/\/fs\/[^/]+\//, "/fs/forged-token/") };
+  const bad = new VMWorker("worker.sh", { serialization: "json", mounts: { "/x": forged } });
+  const why = await new Promise((res) => (bad.onerror = (e) => res(e.message)));
+  if (!/not a directory of this site/.test(why)) fail("forged mount: " + why);
+  note("custom mount ok; forged mount refused");
+
+  document.title = `PASS files ${Math.round(performance.now() - t0)}ms`;
+  note(document.title);
+})().catch((e) => { if (!document.title.startsWith("FAIL")) fail(e.stack || e.message); });
+</script>
